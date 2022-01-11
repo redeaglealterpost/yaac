@@ -127,12 +127,10 @@ class Client
      *
      * @param array $config
      *
-     * @type string $mode The mode for ACME (production / staging)
-     * @type Filesystem $fs (optional) Filesystem for storage of static data
-     * @type string $account_private_key (optional) Account private key in pem format.
-     * @type string $basePath The base path for the filesystem (used to store account information and csr / keys
-     * @type string $username The acme username
-     * @type string $source_ip The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
+     * @type string $mode (required) The mode for ACME (production / staging)
+     * @type string $account_private_key (required) Account private key in pem format.
+     * @type string $username (required) The acme username
+     * @type string $source_ip (optional) The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
      * }
      */
     public function __construct(array $config = [])
@@ -149,7 +147,6 @@ class Client
     /**
      * Get an existing order by ID
      *
-     * @return Order
      * @throws \Exception
      */
     public function getOrder(string $id): Order
