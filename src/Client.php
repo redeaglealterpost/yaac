@@ -9,10 +9,14 @@ use Afosto\Acme\Data\Challenge;
 use Afosto\Acme\Data\Order;
 use Afosto\Acme\Exception\NotReadyOrderException;
 use Afosto\Acme\Exception\UnrecoverableOrderException;
-use GuzzleHttp\Client as HttpClient;
-use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Client as GuzzleHttpClient;
 use GuzzleHttp\Exception\RequestException;
-use League\Flysystem\Filesystem;
+use GuzzleHttp\Psr7\HttpFactory;
+use GuzzleHttp\Psr7\Uri;
+use GuzzleHttp\Psr7\Utils;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\ResponseInterface;
 
 class Client
@@ -93,11 +97,6 @@ class Client
     protected $accountPrivateKeyPem;
 
     /**
-     * @var Filesystem
-     */
-    protected $filesystem;
-
-    /**
      * @var array
      */
     protected $directories = [];
@@ -113,9 +112,9 @@ class Client
     protected $digest;
 
     /**
-     * @var HttpClient
+     * @var ClientInterface
      */
-    protected $httpClient;
+    protected $acmeHttpClient;
 
     /**
      * @var array
@@ -123,23 +122,54 @@ class Client
     protected $config;
 
     /**
-     * Client constructor.
-     *
-     * @param array $config
-     *
-     * @type string $mode (required) The mode for ACME (production / staging)
-     * @type string $account_private_key (required) Account private key in pem format.
-     * @type string $username (required) The acme username
-     * @type string $source_ip (optional) The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
-     * }
+     * @var RequestFactoryInterface
      */
-    public function __construct(array $config = [])
-    {
-        $this->config = $config;
+    protected $requestFactory;
 
-        if ($this->getOption(self::OPTION_USERNAME, false) === false) {
-            throw new \LogicException('Username not provided');
-        }
+    /**
+     * @var ClientInterface
+     */
+    protected $selfTestHttpClient;
+
+    /**
+     * @var ClientInterface
+     */
+    protected $selfTestDNSClient;
+
+    /**
+     * @param string $mode (required) The mode for ACME (production / staging)
+     * @param string $accountPrivateKeyPem (required) Account private key in pem format.
+     * @param string $username (required) The acme username
+     * @param string|null $sourceIp (optional) The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
+     * @type ClientInterface $acmeHttpClient (optional)
+     * @type ClientInterface $selfTestHttpClient (optional)
+     * @type ClientInterface $selfTestDNSClient (optional)
+     * @type RequestFactoryInterface $requestFactory (optional)
+     * }
+     * @throws ClientExceptionInterface
+     */
+    public function __construct(
+        string                  $mode,
+        string                  $username,
+        string                  $accountPrivateKeyPem,
+        string                  $sourceIp = null,
+        ClientInterface         $acmeHttpClient = null,
+        ClientInterface         $selfTestHttpClient = null,
+        ClientInterface         $selfTestDNSClient = null,
+        RequestFactoryInterface $requestFactory = null
+    )
+    {
+        $this->config = [
+            self::OPTION_MODE                    => $mode,
+            self::OPTION_USERNAME                => $username,
+            self::OPTION_ACCOUNT_PRIVATE_KEY_PEM => $accountPrivateKeyPem,
+            self::OPTION_SOURCE_IP               => $sourceIp
+        ];
+
+        $this->acmeHttpClient = $acmeHttpClient ?? $this->createHttpClient();
+        $this->requestFactory = $requestFactory ?? new HttpFactory();
+        $this->selfTestDNSClient = $selfTestDNSClient ?? $this->createSelfTestDNSClient();
+        $this->selfTestHttpClient = $selfTestHttpClient ?? $this->createSelfTestHttpClient();
 
         $this->init();
     }
@@ -147,6 +177,7 @@ class Client
     /**
      * Get an existing order by ID
      *
+     * @throws ClientExceptionInterface
      * @throws \Exception
      */
     public function getOrder(string $id): Order
@@ -182,6 +213,7 @@ class Client
      * Create a new order
      *
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     public function createOrder(array $domains): Order
     {
@@ -221,6 +253,7 @@ class Client
      *
      * @return array|Authorization[]
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     public function authorize(Order $order): array
     {
@@ -252,7 +285,7 @@ class Client
     /**
      * Run a self-test for the authorization
      *
-     * @throws \GuzzleHttp\Exception\GuzzleException
+     * @throws ClientExceptionInterface
      */
     public function selfTest(Authorization $authorization, string $type = self::VALIDATION_HTTP, int $maxAttempts = 15): bool
     {
@@ -275,6 +308,7 @@ class Client
      * @param int $maxAttempts
      * @return bool
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     public function validate(Challenge $challenge, int $maxAttempts = 15): bool
     {
@@ -302,6 +336,10 @@ class Client
         return (isset($data['status']) && $data['status'] == 'valid');
     }
 
+    /**
+     * @throws ClientExceptionInterface
+     * @throws \Exception
+     */
     public function finalize(Order $order, string $privateKey): void
     {
         if (!$order->isReady()) {
@@ -344,6 +382,7 @@ class Client
      * Return a certificate
      *
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     public function getCertificate(Order $order, string $privateKey = null, int $maxProcessingTime = 60): Certificate
     {
@@ -402,6 +441,7 @@ class Client
      *
      * @return Account
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     public function getAccount(): Account
     {
@@ -423,31 +463,30 @@ class Client
 
     /**
      * Returns the ACME api configured Guzzle Client
-     * @return HttpClient
      */
-    protected function getHttpClient(): HttpClient
+    protected function createHttpClient(): ClientInterface
     {
-        if ($this->httpClient === null) {
-            $config = [
-                'base_uri' => (
-                ($this->getOption(self::OPTION_MODE, self::MODE_LIVE) == self::MODE_LIVE) ?
-                    self::DIRECTORY_LIVE : self::DIRECTORY_STAGING),
-            ];
-            if ($this->getOption(self::OPTION_SOURCE_IP, false) !== false) {
-                $config['curl.options']['CURLOPT_INTERFACE'] = $this->getOption(self::OPTION_SOURCE_IP);
-            }
-            $this->httpClient = new HttpClient($config);
+        $isLive = $this->getOption(self::OPTION_MODE) == self::MODE_LIVE;
+
+        $config = [
+            'base_uri' => $isLive ? self::DIRECTORY_LIVE : self::DIRECTORY_STAGING,
+        ];
+
+        if ($this->getOption(self::OPTION_SOURCE_IP)) {
+            $config['curl.options']['CURLOPT_INTERFACE'] = $this->getOption(self::OPTION_SOURCE_IP);
         }
-        return $this->httpClient;
+
+        return new GuzzleHttpClient($config);
     }
 
     /**
      * Returns a Guzzle Client configured for self test
-     * @return HttpClient
+     *
+     * @return GuzzleHttpClient
      */
-    protected function getSelfTestClient(): HttpClient
+    protected function createSelfTestHttpClient(): GuzzleHttpClient
     {
-        return new HttpClient([
+        return new GuzzleHttpClient([
             'verify'          => false,
             'timeout'         => 10,
             'connect_timeout' => 3,
@@ -460,18 +499,22 @@ class Client
      * @param Authorization $authorization
      * @param $maxAttempts
      * @return bool
-     * @throws \GuzzleHttp\Exception\GuzzleException
+     * @throws ClientExceptionInterface
      */
     protected function selfHttpTest(Authorization $authorization, $maxAttempts): bool
     {
+        $uriString = sprintf(
+            'http://%s/.well-known/acme-challenge/%s',
+            $authorization->getDomain(),
+            $authorization->getFile()->getFilename()
+        );
+
+        $request = $this->requestFactory->createRequest('get', $uriString);
+
         do {
             $maxAttempts--;
             try {
-                $response = $this->getSelfTestClient()->request(
-                    'GET',
-                    'http://' . $authorization->getDomain() . '/.well-known/acme-challenge/' .
-                    $authorization->getFile()->getFilename()
-                );
+                $response = $this->selfTestHttpClient->sendRequest($request);
                 $contents = (string)$response->getBody();
                 if ($contents == $authorization->getFile()->getContents()) {
                     return true;
@@ -489,20 +532,19 @@ class Client
      * @param $maxAttempts
      * @return bool
      *
-     * @throws \GuzzleHttp\Exception\GuzzleException
+     * @throws ClientExceptionInterface
      */
     protected function selfDNSTest(Authorization $authorization, $maxAttempts): bool
     {
+        $uri = Uri::fromParts([
+            'path' => '/dns-query',
+            'query' => sprintf('name=%s&type=TXT', $authorization->getTxtRecord()->getName())
+        ]);
+
+        $request = $this->requestFactory->createRequest('get', $uri);
+
         do {
-            $response = $this->getSelfTestDNSClient()->get(
-                '/dns-query',
-                [
-                    'query' => [
-                        'name' => $authorization->getTxtRecord()->getName(),
-                        'type' => 'TXT'
-                    ]
-                ]
-            );
+            $response = $this->selfTestDNSClient->sendRequest($request);
             $data = json_decode((string)$response->getBody(), true);
             if (isset($data['Answer'])) {
                 foreach ($data['Answer'] as $result) {
@@ -523,9 +565,9 @@ class Client
     /**
      * Return the preconfigured client to call Cloudflare's DNS API
      */
-    protected function getSelfTestDNSClient(): HttpClient
+    protected function createSelfTestDNSClient(): GuzzleHttpClient
     {
-        return new HttpClient([
+        return new GuzzleHttpClient([
             'base_uri'        => 'https://cloudflare-dns.com',
             'connect_timeout' => 10,
             'headers'         => [
@@ -536,12 +578,15 @@ class Client
 
     /**
      * Initialize the client
+     *
+     * @throws ClientExceptionInterface
+     * @throws \Exception
      */
     protected function init()
     {
         //Load the directories from the LE api
-        $response = $this->getHttpClient()->get('/directory');
-        $result = \GuzzleHttp\json_decode((string)$response->getBody(), true);
+        $response = $this->acmeHttpClient->sendRequest($this->requestFactory->createRequest('get', '/directory'));
+        $result = json_decode((string)$response->getBody(), true);
         $this->directories = $result;
 
         //Prepare LE account
@@ -565,6 +610,7 @@ class Client
      * Agree to the terms of service
      *
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     protected function tosAgree()
     {
@@ -616,20 +662,16 @@ class Client
 
     /**
      * Send a request to the LE API
+     * @throws ClientExceptionInterface
      */
     protected function request($url, array $payload = [], string $method = 'POST'): ResponseInterface
     {
-        try {
-            $response = $this->getHttpClient()->request($method, $url, [
-                'json'    => $payload,
-                'headers' => [
-                    'Content-Type' => 'application/jose+json',
-                ]
-            ]);
-            $this->nonce = $response->getHeaderLine('replay-nonce');
-        } catch (ClientException $e) {
-            throw $e;
-        }
+        $request = $this->requestFactory->createRequest($method, $url);
+        $request->withBody(Utils::streamFor(json_encode($payload)));
+        $request->withAddedHeader('Content-Type', 'application/jose+json');
+
+        $response = $this->acmeHttpClient->sendRequest($request);
+        $this->nonce = $response->getHeaderLine('replay-nonce');
 
         return $response;
     }
@@ -691,12 +733,13 @@ class Client
      * @param $url
      * @return array
      * @throws \Exception
+     * @throws \Psr\Http\Client\ClientExceptionInterface
      */
     protected function getJWK($url): array
     {
         //Require a nonce to be available
         if ($this->nonce === null) {
-            $response = $this->getHttpClient()->head($this->directories[self::DIRECTORY_NEW_NONCE]);
+            $response = $this->acmeHttpClient->sendRequest($this->requestFactory->createRequest('head', $this->directories[self::DIRECTORY_NEW_NONCE]));
             $this->nonce = $response->getHeaderLine('replay-nonce');
         }
         return [
@@ -711,12 +754,12 @@ class Client
      * Get KID envelope
      *
      * @param $url
-     * @param $kid
      * @return array
+     * @throws ClientExceptionInterface
      */
     protected function getKID($url): array
     {
-        $response = $this->getHttpClient()->head($this->directories[self::DIRECTORY_NEW_NONCE]);
+        $response = $this->acmeHttpClient->sendRequest($this->requestFactory->createRequest('head', $this->directories[self::DIRECTORY_NEW_NONCE]));
         $nonce = $response->getHeaderLine('replay-nonce');
 
         return [
@@ -734,6 +777,7 @@ class Client
      * @param $url
      * @return array
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     protected function signPayloadJWK($payload, $url): array
     {
@@ -761,6 +805,7 @@ class Client
      * @param $url
      * @return array
      * @throws \Exception
+     * @throws ClientExceptionInterface
      */
     protected function signPayloadKid($payload, $url): array
     {
