@@ -1,5 +1,14 @@
 # yaac - Yet another ACME client
 
+This is a fork of [afosto/yaac](https://github.com/afosto/yaac) package.
+
+Changes:
+- [x] add docker image to simplify development
+- [x] add ability to pass own private key for Order
+- [ ] pass account private key
+- [ ] using PSR-18 Http Client and ability to pass them with dependency injection
+- [ ] add tests
+
 Written in PHP, this client aims to be a simplified and decoupled Let’s Encrypt client, based on [ACME V2](https://tools.ietf.org/html/rfc8555).
 
 ## Decoupled from a filesystem or webserver

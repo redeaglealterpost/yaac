@@ -7,6 +7,8 @@ use Afosto\Acme\Data\Authorization;
 use Afosto\Acme\Data\Certificate;
 use Afosto\Acme\Data\Challenge;
 use Afosto\Acme\Data\Order;
+use Afosto\Acme\Exception\NotReadyOrderException;
+use Afosto\Acme\Exception\UnrecoverableOrderException;
 use GuzzleHttp\Client as HttpClient;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\RequestException;
@@ -122,9 +124,10 @@ class Client
      * @type string $source_ip The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
      * }
      */
-    public function __construct($config = [])
+    public function __construct(array $config = [])
     {
         $this->config = $config;
+
         if ($this->getOption('fs', false)) {
             $this->filesystem = $this->getOption('fs');
         } else {
@@ -164,29 +167,19 @@ class Client
             $data['expires'],
             $data['identifiers'],
             $data['authorizations'],
-            $data['finalize']
+            $data['finalize'],
+            $data['certificate'] ?? null
         );
     }
 
-    /**
-     * Get ready status for order
-     *
-     * @param Order $order
-     * @return bool
-     * @throws \Exception
-     */
-    public function isReady(Order $order): bool
+    public function refreshOrder(Order $order): void
     {
-        $order = $this->getOrder($order->getId());
-        return $order->getStatus() == 'ready';
+        $order->updateWith($this->getOrder($order->getId()));
     }
-
 
     /**
      * Create a new order
      *
-     * @param array $domains
-     * @return Order
      * @throws \Exception
      */
     public function createOrder(array $domains): Order
@@ -209,24 +202,22 @@ class Client
         ));
 
         $data = json_decode((string)$response->getBody(), true);
-        $order = new Order(
+
+        return new Order(
             $domains,
             $response->getHeaderLine('location'),
             $data['status'],
             $data['expires'],
             $data['identifiers'],
             $data['authorizations'],
-            $data['finalize']
+            $data['finalize'],
+            null
         );
-
-
-        return $order;
     }
 
     /**
      * Obtain authorizations
      *
-     * @param Order $order
      * @return array|Authorization[]
      * @throws \Exception
      */
@@ -259,17 +250,20 @@ class Client
 
     /**
      * Run a self-test for the authorization
-     * @param Authorization $authorization
-     * @param string $type
-     * @param int $maxAttempts
-     * @return bool
+     *
+     * @throws \GuzzleHttp\Exception\GuzzleException
      */
-    public function selfTest(Authorization $authorization, $type = self::VALIDATION_HTTP, $maxAttempts = 15): bool
+    public function selfTest(Authorization $authorization, string $type = self::VALIDATION_HTTP, int $maxAttempts = 15): bool
     {
-        if ($type == self::VALIDATION_HTTP) {
-            return $this->selfHttpTest($authorization, $maxAttempts);
-        } elseif ($type == self::VALIDATION_DNS) {
-            return $this->selfDNSTest($authorization, $maxAttempts);
+        switch ($type) {
+            case self::VALIDATION_HTTP:
+                return $this->selfHttpTest($authorization, $maxAttempts);
+            case self::VALIDATION_DNS:
+                return $this->selfDNSTest($authorization, $maxAttempts);
+            default:
+                throw new \InvalidArgumentException(
+                    sprintf('$type should be one of %s, %s given', join(', ', [self::VALIDATION_DNS, self::VALIDATION_HTTP]), $type)
+                );
         }
     }
 
@@ -281,7 +275,7 @@ class Client
      * @return bool
      * @throws \Exception
      */
-    public function validate(Challenge $challenge, $maxAttempts = 15): bool
+    public function validate(Challenge $challenge, int $maxAttempts = 15): bool
     {
         $this->request(
             $challenge->getUrl(),
@@ -291,6 +285,7 @@ class Client
         );
 
         $data = [];
+
         do {
             $response = $this->request(
                 $challenge->getAuthorizationURL(),
@@ -306,16 +301,12 @@ class Client
         return (isset($data['status']) && $data['status'] == 'valid');
     }
 
-    /**
-     * Return a certificate
-     *
-     * @param Order $order
-     * @return Certificate
-     * @throws \Exception
-     */
-    public function getCertificate(Order $order): Certificate
+    public function finalize(Order $order, string $privateKey): void
     {
-        $privateKey = Helper::getNewKey();
+        if (!$order->isReady()) {
+            throw new NotReadyOrderException($order);
+        }
+
         $csr = Helper::getCsr($order->getDomains(), $privateKey);
         $der = Helper::toDer($csr);
 
@@ -327,15 +318,83 @@ class Client
             )
         );
 
-        $data = json_decode((string)$response->getBody(), true);
-        $certificateResponse = $this->request(
-            $data['certificate'],
-            $this->signPayloadKid(null, $data['certificate'])
-        );
-        $chain = $str = preg_replace('/^[ \t]*[\r\n]+/m', '', (string)$certificateResponse->getBody());
-        return new Certificate($privateKey, $csr, $chain);
+        $data = json_decode($response->getBody()->getContents(), true);
+
+        if (Order::STATUS_INVALID === $data['status'] || isset($data['error'])) {
+            throw new UnrecoverableOrderException(
+                $order,
+                sprintf('Error while finalization: %s', json_encode($data['error']))
+            );
+        }
+
+        $order->updateWith(new Order(
+            $order->getDomains(),
+            $order->getURL(),
+            $data['status'],
+            $data['expires'],
+            $data['identifiers'],
+            $data['authorizations'],
+            $data['finalize'],
+            $data['certificate'] ?? null
+        ));
     }
 
+    /**
+     * Return a certificate
+     *
+     * @throws \Exception
+     */
+    public function getCertificate(Order $order, string $privateKey = null, int $maxProcessingTime = 60): Certificate
+    {
+        if (!$order->isValid() && !$order->isReady()) {
+            throw new NotReadyOrderException(
+                $order,
+                'Order is not ready yet. Check authorizations or just wait for a while.'
+            );
+        }
+
+        if (null === $privateKey && $order->isValid()) {
+            throw new UnrecoverableOrderException(
+                $order,
+                'Can\'t retrieve certificate for finalized order without private key used for finalization. Restart order.'
+            );
+        }
+
+        $privateKey = $privateKey ?? Helper::getNewKey();
+
+        if ($order->isReady()) {
+            $this->finalize($order, $privateKey);
+        }
+
+        $sleep = 0;
+        while ($order->isProcessing() && $sleep < $maxProcessingTime) {
+            $sleep += 5;
+            sleep(5);
+            $this->refreshOrder($order);
+        }
+
+        if ($order->isProcessing()) {
+            throw new NotReadyOrderException(
+                $order,
+                'Order freeze in processing status. Check authorizations or just wait for a while.'
+            );
+        }
+
+        if (!$order->isValid()) {
+            throw new UnrecoverableOrderException(
+                $order,
+                'Order has invalid status. '
+            );
+        }
+
+        $certificateResponse = $this->request(
+            $order->getCertificateUrl(),
+            $this->signPayloadKid(null, $order->getCertificateUrl())
+        );
+
+        $chain = $str = preg_replace('/^[ \t]*[\r\n]+/m', '', (string)$certificateResponse->getBody());
+        return new Certificate($privateKey, $chain);
+    }
 
     /**
      * Return LE account information
@@ -365,7 +424,7 @@ class Client
      * Returns the ACME api configured Guzzle Client
      * @return HttpClient
      */
-    protected function getHttpClient()
+    protected function getHttpClient(): HttpClient
     {
         if ($this->httpClient === null) {
             $config = [
@@ -385,7 +444,7 @@ class Client
      * Returns a Guzzle Client configured for self test
      * @return HttpClient
      */
-    protected function getSelfTestClient()
+    protected function getSelfTestClient(): HttpClient
     {
         return new HttpClient([
             'verify'          => false,
@@ -400,8 +459,9 @@ class Client
      * @param Authorization $authorization
      * @param $maxAttempts
      * @return bool
+     * @throws \GuzzleHttp\Exception\GuzzleException
      */
-    protected function selfHttpTest(Authorization $authorization, $maxAttempts)
+    protected function selfHttpTest(Authorization $authorization, $maxAttempts): bool
     {
         do {
             $maxAttempts--;
@@ -427,8 +487,10 @@ class Client
      * @param Authorization $authorization
      * @param $maxAttempts
      * @return bool
+     *
+     * @throws \GuzzleHttp\Exception\GuzzleException
      */
-    protected function selfDNSTest(Authorization $authorization, $maxAttempts)
+    protected function selfDNSTest(Authorization $authorization, $maxAttempts): bool
     {
         do {
             $response = $this->getSelfTestDNSClient()->get(
@@ -459,9 +521,8 @@ class Client
 
     /**
      * Return the preconfigured client to call Cloudflare's DNS API
-     * @return HttpClient
      */
-    protected function getSelfTestDNSClient()
+    protected function getSelfTestDNSClient(): HttpClient
     {
         return new HttpClient([
             'base_uri'        => 'https://cloudflare-dns.com',
@@ -537,9 +598,9 @@ class Client
         $userDirectory = preg_replace('/[^a-z0-9]+/', '-', strtolower($this->getOption('username')));
 
         return $this->getOption(
-            'basePath',
-            'le'
-        ) . DIRECTORY_SEPARATOR . $userDirectory . ($path === null ? '' : DIRECTORY_SEPARATOR . $path);
+                'basePath',
+                'le'
+            ) . DIRECTORY_SEPARATOR . $userDirectory . ($path === null ? '' : DIRECTORY_SEPARATOR . $path);
     }
 
     /**
@@ -585,13 +646,8 @@ class Client
 
     /**
      * Send a request to the LE API
-     *
-     * @param $url
-     * @param array $payload
-     * @param string $method
-     * @return ResponseInterface
      */
-    protected function request($url, $payload = [], $method = 'POST'): ResponseInterface
+    protected function request($url, array $payload = [], string $method = 'POST'): ResponseInterface
     {
         try {
             $response = $this->getHttpClient()->request($method, $url, [

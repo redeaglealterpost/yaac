@@ -28,11 +28,6 @@ class Certificate
     protected $intermediateCertificate;
 
     /**
-     * @var string
-     */
-    protected $csr;
-
-    /**
      * @var \DateTime
      */
     protected $expiryDate;
@@ -40,26 +35,15 @@ class Certificate
     /**
      * Certificate constructor.
      * @param $privateKey
-     * @param $csr
      * @param $chain
      * @throws \Exception
      */
-    public function __construct($privateKey, $csr, $chain)
+    public function __construct($privateKey, $chain)
     {
         $this->privateKey = $privateKey;
-        $this->csr = $csr;
         $this->chain = $chain;
         list($this->certificate, $this->intermediateCertificate) = Helper::splitCertificate($chain);
         $this->expiryDate = Helper::getCertExpiryDate($chain);
-    }
-
-    /**
-     * Get the certificate signing request
-     * @return string
-     */
-    public function getCsr(): string
-    {
-        return $this->csr;
     }
 
     /**
@@ -77,7 +61,7 @@ class Certificate
      * @param bool $asChain
      * @return string
      */
-    public function getCertificate($asChain = true): string
+    public function getCertificate(bool $asChain = true): string
     {
         return $asChain ? $this->chain : $this->certificate;
     }
