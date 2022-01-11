@@ -17,6 +17,11 @@ use Psr\Http\Message\ResponseInterface;
 
 class Client
 {
+    const OPTION_USERNAME = 'username';
+    const OPTION_ACCOUNT_PRIVATE_KEY_PEM = 'account_private_key_pem';
+    const OPTION_MODE = 'mode';
+    const OPTION_SOURCE_IP = 'source_ip';
+
     /**
      * Live url
      */
@@ -83,6 +88,11 @@ class Client
     protected $accountKey;
 
     /**
+     * @var string
+     */
+    protected $accountPrivateKeyPem;
+
+    /**
      * @var Filesystem
      */
     protected $filesystem;
@@ -118,7 +128,8 @@ class Client
      * @param array $config
      *
      * @type string $mode The mode for ACME (production / staging)
-     * @type Filesystem $fs Filesystem for storage of static data
+     * @type Filesystem $fs (optional) Filesystem for storage of static data
+     * @type string $account_private_key (optional) Account private key in pem format.
      * @type string $basePath The base path for the filesystem (used to store account information and csr / keys
      * @type string $username The acme username
      * @type string $source_ip The source IP for Guzzle (via curl.options) to bind to (defaults to 0.0.0.0 [OS default])
@@ -128,13 +139,7 @@ class Client
     {
         $this->config = $config;
 
-        if ($this->getOption('fs', false)) {
-            $this->filesystem = $this->getOption('fs');
-        } else {
-            throw new \LogicException('No filesystem option supplied');
-        }
-
-        if ($this->getOption('username', false) === false) {
+        if ($this->getOption(self::OPTION_USERNAME, false) === false) {
             throw new \LogicException('Username not provided');
         }
 
@@ -144,11 +149,10 @@ class Client
     /**
      * Get an existing order by ID
      *
-     * @param $id
      * @return Order
      * @throws \Exception
      */
-    public function getOrder($id): Order
+    public function getOrder(string $id): Order
     {
         $url = str_replace('new-order', 'order', $this->getUrl(self::DIRECTORY_NEW_ORDER));
         $url = $url . '/' . $this->getAccount()->getId() . '/' . $id;
@@ -429,11 +433,11 @@ class Client
         if ($this->httpClient === null) {
             $config = [
                 'base_uri' => (
-                ($this->getOption('mode', self::MODE_LIVE) == self::MODE_LIVE) ?
+                ($this->getOption(self::OPTION_MODE, self::MODE_LIVE) == self::MODE_LIVE) ?
                     self::DIRECTORY_LIVE : self::DIRECTORY_STAGING),
             ];
-            if ($this->getOption('source_ip', false) !== false) {
-                $config['curl.options']['CURLOPT_INTERFACE'] = $this->getOption('source_ip');
+            if ($this->getOption(self::OPTION_SOURCE_IP, false) !== false) {
+                $config['curl.options']['CURLOPT_INTERFACE'] = $this->getOption(self::OPTION_SOURCE_IP);
             }
             $this->httpClient = new HttpClient($config);
         }
@@ -551,18 +555,12 @@ class Client
 
     /**
      * Load the keys in memory
-     *
-     * @throws \League\Flysystem\FileExistsException
-     * @throws \League\Flysystem\FileNotFoundException
      */
-    protected function loadKeys()
+    protected function loadKeys(): void
     {
-        //Make sure a private key is in place
-        if ($this->getFilesystem()->has($this->getPath('account.pem')) === false) {
-            $this->getFilesystem()->write($this->getPath('account.pem'), Helper::getNewKey());
-        }
-        $privateKey = $this->getFilesystem()->read($this->getPath('account.pem'));
-        $privateKey = openssl_pkey_get_private($privateKey);
+        $this->accountPrivateKeyPem = $this->getOption(self::OPTION_ACCOUNT_PRIVATE_KEY_PEM, Helper::getNewKey());
+
+        $privateKey = openssl_pkey_get_private($this->accountPrivateKeyPem);
         $this->privateKeyDetails = openssl_pkey_get_details($privateKey);
     }
 
@@ -578,38 +576,13 @@ class Client
             $this->signPayloadJWK(
                 [
                     'contact'              => [
-                        'mailto:' . $this->getOption('username'),
+                        'mailto:' . $this->getOption(self::OPTION_USERNAME),
                     ],
                     'termsOfServiceAgreed' => true,
                 ],
                 $this->getUrl(self::DIRECTORY_NEW_ACCOUNT)
             )
         );
-    }
-
-    /**
-     * Get a formatted path
-     *
-     * @param null $path
-     * @return string
-     */
-    protected function getPath($path = null): string
-    {
-        $userDirectory = preg_replace('/[^a-z0-9]+/', '-', strtolower($this->getOption('username')));
-
-        return $this->getOption(
-                'basePath',
-                'le'
-            ) . DIRECTORY_SEPARATOR . $userDirectory . ($path === null ? '' : DIRECTORY_SEPARATOR . $path);
-    }
-
-    /**
-     * Return the Flysystem filesystem
-     * @return Filesystem
-     */
-    protected function getFilesystem(): Filesystem
-    {
-        return $this->filesystem;
     }
 
     /**
@@ -681,7 +654,6 @@ class Client
         throw new \Exception('Invalid directory: ' . $directory . ' not listed');
     }
 
-
     /**
      * Get the key
      *
@@ -691,8 +663,7 @@ class Client
     protected function getAccountKey()
     {
         if ($this->accountKey === null) {
-            $this->accountKey = openssl_pkey_get_private($this->getFilesystem()
-                ->read($this->getPath('account.pem')));
+            $this->accountKey = openssl_pkey_get_private($this->accountPrivateKeyPem);
         }
 
         if ($this->accountKey === false) {

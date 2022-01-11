@@ -26,7 +26,6 @@
   "require": {
     "php": "^7.2|^8.0",
     "guzzlehttp/guzzle": "^6.3|^7.0",
-    "league/flysystem": "^1.0",
     "ext-openssl": "*",
     "ext-json": "*"
   }
