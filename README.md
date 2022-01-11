@@ -5,7 +5,7 @@ This is a fork of [afosto/yaac](https://github.com/afosto/yaac) package.
 Changes:
 - [x] add docker image to simplify development
 - [x] add ability to pass own private key for Order
-- [ ] pass account private key
+- [x] pass account private key
 - [ ] using PSR-18 Http Client and ability to pass them with dependency injection
 - [ ] add tests
 
