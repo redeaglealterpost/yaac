@@ -9,9 +9,9 @@ use Afosto\Acme\Data\Challenge;
 use Afosto\Acme\Data\Order;
 use Afosto\Acme\Exception\NotReadyOrderException;
 use Afosto\Acme\Exception\UnrecoverableOrderException;
+use Afosto\Acme\PSR\RequestFactory;
 use GuzzleHttp\Client as GuzzleHttpClient;
 use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Psr7\HttpFactory;
 use GuzzleHttp\Psr7\Uri;
 use GuzzleHttp\Psr7\Utils;
 use Psr\Http\Client\ClientExceptionInterface;
@@ -167,9 +167,16 @@ class Client
         ];
 
         $this->acmeHttpClient = $acmeHttpClient ?? $this->createHttpClient();
-        $this->requestFactory = $requestFactory ?? new HttpFactory();
         $this->selfTestDNSClient = $selfTestDNSClient ?? $this->createSelfTestDNSClient();
         $this->selfTestHttpClient = $selfTestHttpClient ?? $this->createSelfTestHttpClient();
+
+        if ($requestFactory) {
+            $this->requestFactory = $requestFactory;
+        } elseif (class_exists('GuzzleHttp\Psr7\HttpFactory')) {
+            $this->requestFactory = new \GuzzleHttp\Psr7\HttpFactory();
+        } else {
+            $this->requestFactory = new RequestFactory();
+        }
 
         $this->init();
     }
