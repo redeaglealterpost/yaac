@@ -674,8 +674,8 @@ class Client
     protected function request($url, array $payload = [], string $method = 'POST'): ResponseInterface
     {
         $request = $this->requestFactory->createRequest($method, $url);
-        $request->withBody(Utils::streamFor(json_encode($payload)));
-        $request->withAddedHeader('Content-Type', 'application/jose+json');
+        $request = $request->withBody(Utils::streamFor(json_encode($payload)));
+        $request = $request->withAddedHeader('Content-Type', 'application/jose+json');
 
         $response = $this->acmeHttpClient->sendRequest($request);
         $this->nonce = $response->getHeaderLine('replay-nonce');
